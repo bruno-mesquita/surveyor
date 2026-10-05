@@ -24,6 +24,16 @@ dependencies {
 	modImplementation libs.fl
 
 	modImplementation libs.fapi
+
+	testImplementation "net.fabricmc:fabric-loader-junit:${libs.versions.fl.get()}"
+	testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher:1.10.2"
+}
+
+test {
+	useJUnitPlatform()
+	workingDir = layout.buildDirectory.dir("test-run").get().asFile
+	doFirst { workingDir.mkdirs() }
 }
 
 processResources {

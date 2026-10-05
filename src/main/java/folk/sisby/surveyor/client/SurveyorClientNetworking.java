@@ -8,6 +8,7 @@ import folk.sisby.surveyor.SurveyorNetworking;
 import folk.sisby.surveyor.WorldSummary;
 import folk.sisby.surveyor.landmark.WorldLandmarks;
 import folk.sisby.surveyor.packet.C2SFragmentPacket;
+import folk.sisby.surveyor.packet.FragmentAssembler;
 import folk.sisby.surveyor.packet.S2CGroupAmendedPacket;
 import folk.sisby.surveyor.packet.S2CGroupChangedPacket;
 import folk.sisby.surveyor.packet.S2CGroupUpdatedPacket;
@@ -42,6 +43,8 @@ public class SurveyorClientNetworking {
 			p.toBufs().forEach(buf -> {
 				if (buf.readableBytes() <= C2SFragmentPacket.MAX_C2S_PAYLOAD_SIZE) {
 					ClientPlayNetworking.send(p.getId(), buf);
+				} else if (buf.readableBytes() > FragmentAssembler.MAX_PENDING_BYTES) {
+					Surveyor.LOGGER.warn("[Surveyor] Not sending {} to the server - it's too large ({} bytes, max {}).", p.getId(), buf.readableBytes(), FragmentAssembler.MAX_PENDING_BYTES);
 				} else if (ClientPlayNetworking.canSend(C2SFragmentPacket.ID)) {
 					C2SFragmentPacket.split(p.getId(), buf).forEach(f -> ClientPlayNetworking.send(f.getId(), f.toBufs().iterator().next()));
 				} else {

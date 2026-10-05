@@ -11,6 +11,7 @@ import folk.sisby.surveyor.packet.C2SKnownLandmarksPacket;
 import folk.sisby.surveyor.packet.C2SKnownStructuresPacket;
 import folk.sisby.surveyor.packet.C2SKnownTerrainPacket;
 import folk.sisby.surveyor.packet.C2SPacket;
+import folk.sisby.surveyor.packet.FragmentAssembler;
 import folk.sisby.surveyor.packet.S2CStructuresAddedPacket;
 import folk.sisby.surveyor.packet.SyncLandmarksAddedPacket;
 import folk.sisby.surveyor.packet.SyncLandmarksRemovedPacket;
@@ -19,7 +20,6 @@ import folk.sisby.surveyor.structure.WorldStructures;
 import folk.sisby.surveyor.terrain.WorldTerrain;
 import folk.sisby.surveyor.util.MapUtil;
 import folk.sisby.surveyor.util.RegionPos;
-import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
@@ -38,6 +38,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 public class SurveyorNetworking {
@@ -45,54 +46,42 @@ public class SurveyorNetworking {
 	public static Consumer<C2SPacket> C2S_SENDER = p -> {
 	};
 
-	private static final int MAX_FRAGMENTED_PAYLOAD_SIZE = 16 * 1024 * 1024;
-	private static final Map<Identifier, FragmentReader> FRAGMENT_READERS = new ConcurrentHashMap<>();
-	private static final Map<FragmentKey, ByteBuf> FRAGMENTS = new ConcurrentHashMap<>();
-
-	private record FragmentKey(UUID player, Identifier target) {
-	}
+	private static final FragmentAssembler FRAGMENTS = new FragmentAssembler();
+	private static final Map<Identifier, FragmentTarget> FRAGMENT_TARGETS = new ConcurrentHashMap<>();
 
 	private interface FragmentReader {
 		void handle(MinecraftServer server, ServerPlayerEntity player, PacketByteBuf buf);
 	}
 
+	private record FragmentTarget(FragmentReader reader, Supplier<NetworkMode> mode) {
+	}
+
 	private static <T extends C2SPacket> void registerC2S(Identifier id, Function<PacketByteBuf, T> reader, ServerPacketHandler<T> handler) {
 		ServerPlayNetworking.registerGlobalReceiver(id, (sv, p, h, b, se) -> handleServer(sv, p, b, reader, handler));
-		FRAGMENT_READERS.put(id, (sv, p, b) -> handleServer(sv, p, b, reader, handler));
+	}
+
+	private static <T extends C2SPacket> void registerFragmentableC2S(Identifier id, Function<PacketByteBuf, T> reader, ServerPacketHandler<T> handler, Supplier<NetworkMode> mode) {
+		registerC2S(id, reader, handler);
+		FRAGMENT_TARGETS.put(id, new FragmentTarget((sv, p, b) -> handleServer(sv, p, b, reader, handler), mode));
 	}
 
 	public static void init() {
-		registerC2S(C2SKnownTerrainPacket.ID, C2SKnownTerrainPacket::read, SurveyorNetworking::handleKnownTerrain);
-		registerC2S(C2SKnownStructuresPacket.ID, C2SKnownStructuresPacket::read, SurveyorNetworking::handleKnownStructures);
-		registerC2S(C2SKnownLandmarksPacket.ID, C2SKnownLandmarksPacket::read, SurveyorNetworking::handleKnownLandmarks);
+		registerFragmentableC2S(C2SKnownTerrainPacket.ID, C2SKnownTerrainPacket::read, SurveyorNetworking::handleKnownTerrain, () -> Surveyor.CONFIG.networking.terrain);
+		registerFragmentableC2S(C2SKnownStructuresPacket.ID, C2SKnownStructuresPacket::read, SurveyorNetworking::handleKnownStructures, () -> Surveyor.CONFIG.networking.structures);
+		registerFragmentableC2S(C2SKnownLandmarksPacket.ID, C2SKnownLandmarksPacket::read, SurveyorNetworking::handleKnownLandmarks, () -> Surveyor.CONFIG.networking.landmarks);
 		registerC2S(SyncLandmarksAddedPacket.ID, SyncLandmarksAddedPacket::read, SurveyorNetworking::handleLandmarksAdded);
 		registerC2S(SyncLandmarksRemovedPacket.ID, SyncLandmarksRemovedPacket::read, SurveyorNetworking::handleLandmarksRemoved);
 		registerC2S(SyncLandmarksRequestedPacket.ID, SyncLandmarksRequestedPacket::read, SurveyorNetworking::handleLandmarksRequested);
 		ServerPlayNetworking.registerGlobalReceiver(C2SFragmentPacket.ID, (sv, p, h, b, se) -> handleFragment(sv, p, C2SFragmentPacket.read(b)));
-		ServerPlayConnectionEvents.DISCONNECT.register((h, sv) -> FRAGMENTS.keySet().removeIf(k -> {
-			if (!k.player().equals(h.getPlayer().getUuid())) return false;
-			ByteBuf partial = FRAGMENTS.get(k);
-			if (partial != null) partial.release();
-			return true;
-		}));
+		ServerPlayConnectionEvents.DISCONNECT.register((h, sv) -> FRAGMENTS.clear(h.getPlayer().getUuid()));
 	}
 
 	private static void handleFragment(MinecraftServer server, ServerPlayerEntity player, C2SFragmentPacket fragment) {
-		FragmentReader reader = FRAGMENT_READERS.get(fragment.target());
-		if (reader == null) return;
-		FragmentKey key = new FragmentKey(player.getUuid(), fragment.target());
-		ByteBuf partial = FRAGMENTS.computeIfAbsent(key, k -> Unpooled.buffer());
-		if (partial.readableBytes() + fragment.data().length > MAX_FRAGMENTED_PAYLOAD_SIZE) {
-			Surveyor.LOGGER.warn("[Surveyor] Dropping oversized fragmented {} from player {}", fragment.target(), player.getGameProfile().getName());
-			FRAGMENTS.remove(key);
-			partial.release();
-			return;
-		}
-		partial.writeBytes(fragment.data());
-		if (!fragment.last()) return;
-		FRAGMENTS.remove(key);
-		reader.handle(server, player, new PacketByteBuf(partial));
-		partial.release();
+		FragmentTarget target = FRAGMENT_TARGETS.get(fragment.target());
+		if (target == null || target.mode().get().atMost(NetworkMode.NONE)) return;
+		byte[] payload = FRAGMENTS.accept(player.getUuid(), fragment.target(), fragment.last(), fragment.data(), System.currentTimeMillis());
+		if (payload == null) return;
+		target.reader().handle(server, player, new PacketByteBuf(Unpooled.wrappedBuffer(payload)));
 	}
 
 	private static void handleKnownTerrain(MinecraftServer server, ServerPlayerEntity player, C2SKnownTerrainPacket packet) {
